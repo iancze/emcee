@@ -5,6 +5,7 @@ from __future__ import (division, print_function, absolute_import,
                         unicode_literals)
 from .sampler import *
 from .mh import *
+from .gibbs import *
 from .ensemble import *
 from .ptsampler import *
 from . import utils

@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-A vanilla Metropolis-Hastings sampler
+A Gibbs sampler for a state-ful model, using the MH code.
 
 """
 
 from __future__ import (division, print_function, absolute_import,
                         unicode_literals)
 
-__all__ = ["MHSampler"]
+__all__ = ["GibbsSampler", "GibbsController"]
 
 import numpy as np
 
@@ -17,7 +17,7 @@ from .sampler import Sampler
 
 
 # === MHSampler ===
-class MHSampler(Sampler):
+class GibbsSampler(Sampler):
     """
     The most basic possible Metropolis-Hastings style MCMC sampler, designed to be 
     encapsulated as part of a state-ful Gibbs sampler.
@@ -46,17 +46,22 @@ class MHSampler(Sampler):
         will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
 
     """
-    def __init__(self, cov, revertfn, *args, **kwargs):
-        super(MHSampler, self).__init__(*args, **kwargs)
+    def __init__(self, cov, p0, revertfn, *args, **kwargs):
+        try:
+            self.debug = kwargs["debug"]
+        except KeyError:
+            self.debug = False
+        super(GibbsSampler, self).__init__(*args, **kwargs)
         self.cov = cov
+        self.p0 = p0
         self.revertfn = revertfn
 
     def reset(self):
-        super(MHSampler, self).reset()
+        super(GibbsSampler, self).reset()
         self._chain = np.empty((0, self.dim))
         self._lnprob = np.empty(0)
 
-    def sample(self, p0, lnprob=None, randomstate=None, thin=1,
+    def sample(self, p0, lnprob0=None, randomstate=None, thin=1,
                storechain=True, iterations=1):
         """
         Advances the chain ``iterations`` steps as an iterator
@@ -100,8 +105,8 @@ class MHSampler(Sampler):
         self.random_state = randomstate
 
         p = np.array(p0)
-        if lnprob is None:
-            lnprob = self.get_lnprob(p)
+        if lnprob0 is None:
+            lnprob0 = self.get_lnprob(p)
 
         # Resize the chain in advance.
         if storechain:
@@ -116,30 +121,37 @@ class MHSampler(Sampler):
             self.iterations += 1
 
             # Calculate the proposal distribution.
-            q = self._random.multivariate_normal(p, self.cov)
+            if self.dim == 1:
+                q = self._random.normal(loc=p[0], scale=self.cov[0], size=(1,))
+            else:
+                q = self._random.multivariate_normal(p, self.cov)
+
+
             newlnprob = self.get_lnprob(q)
-            diff = newlnprob - lnprob
+            diff = newlnprob - lnprob0
 
             # M-H acceptance ratio
             if diff < 0:
                 diff = np.exp(diff) - self._random.rand()
                 if diff < 0:
                     #Reject the proposal and revert the state of the model
+                    if self.debug:
+                        print("Proposal rejected")
                     self.revertfn()
 
             if diff > 0:
                 #Accept the new proposal
                 p = q
-                lnprob = newlnprob
+                lnprob0 = newlnprob
                 self.naccepted += 1
 
             if storechain and i % thin == 0:
                 ind = i0 + int(i / thin)
                 self._chain[ind, :] = p
-                self._lnprob[ind] = lnprob
+                self._lnprob[ind] = lnprob0
 
             # Heavy duty iterator action going on right here...
-            yield p, lnprob, self.random_state
+            yield p, lnprob0, self.random_state
 
     @property
     def acor(self):
@@ -161,3 +173,48 @@ class MHSampler(Sampler):
 
         """
         return autocorr.integrated_time(self.chain, axis=0, window=window)
+
+
+class GibbsController:
+    '''
+    One Sampler to rule them all. Rotates among all of the subsamplers.
+
+    :param samplers: a list of the various GibbsSampler objects to iterate amongst
+    '''
+
+    def __init__(self, samplers, debug=False):
+        self.samplers = samplers
+        self.nsamplers = len(self.samplers)
+        self.debug = debug
+
+    def reset(self):
+        for sampler in self.samplers:
+            sampler.reset()
+
+    def run(self, iterations):
+        lnprob0 = -np.inf
+        for i in range(iterations):
+            if self.debug:
+                print("\n\nGibbsController on iteration {} of {}".format(i, iterations))
+            for j in range(self.nsamplers):
+                sampler = self.samplers[j]
+                
+                sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0)
+                if self.debug:
+                    print("lnprob0 is", lnprob0)
+
+    def acceptance_fraction(self):
+        return [sampler.acceptance_fraction for sampler in self.samplers]
+
+    def acor(self):
+        return [sampler.acor for sampler in self.samplers]
+
+    def flatchain(self):
+        '''
+        Stack all of the separate subsamples into the standard emcee format. Assumes that each subsampler
+        has been run for the same amount of iterations.
+        '''
+        #check to make sure each sampler has been run for the same amount of iterations
+        assert np.all([sampler.iterations == self.samplers[0].iterations for sampler in self.samplers])
+        #concatenate samples into standard emcee format
+        return np.hstack([sampler.flatchain for sampler in self.samplers])
