@@ -34,7 +34,7 @@ class Sampler(object):
         will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
 
     """
-    def __init__(self, dim, lnprobfn, args=[], kwargs={}):
+    def __init__(self, dim, lnprobfn, args=[], kwargs={}, **extrakwargs): #Allow extra parameters to be thrown away
         self.dim = dim
         self.lnprobfn = lnprobfn
         self.args = args

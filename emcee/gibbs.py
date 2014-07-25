@@ -8,7 +8,7 @@ A Gibbs sampler for a state-ful model, using the MH code.
 from __future__ import (division, print_function, absolute_import,
                         unicode_literals)
 
-__all__ = ["GibbsSampler", "GibbsController"]
+__all__ = ["GibbsSampler", "GibbsSubController", "GibbsController"]
 
 import numpy as np
 
@@ -126,7 +126,6 @@ class GibbsSampler(Sampler):
             else:
                 q = self._random.multivariate_normal(p, self.cov)
 
-
             newlnprob = self.get_lnprob(q)
             diff = newlnprob - lnprob0
 
@@ -141,6 +140,8 @@ class GibbsSampler(Sampler):
 
             if diff > 0:
                 #Accept the new proposal
+                if self.debug:
+                    print("Proposal accepted")
                 p = q
                 lnprob0 = newlnprob
                 self.naccepted += 1
@@ -174,18 +175,68 @@ class GibbsSampler(Sampler):
         """
         return autocorr.integrated_time(self.chain, axis=0, window=window)
 
+class GibbsSubController:
+    '''
+    Designed to be a node in the hierarchy of samplers, yet still be run by a GibbsController
+
+    :param samplers: a list of the various GibbsSampler or GibbsSubController objects to iterate amongst
+
+    '''
+
+    def __init__(self, samplers, **kwargs):
+        self.samplers = samplers
+        self.nsamplers = len(self.samplers)
+        self.debug = kwargs.get("debug", False)
+        self.p0 = None
+
+    def reset(self):
+        for sampler in self.samplers:
+            sampler.reset()
+
+    def run_mcmc(self, p0, iterations, lnprob0):
+        #p0 is taken as a parameter to act like a GibbsSampler for compatibility with GibbsController but is discarded
+        for i in range(iterations):
+            if self.debug:
+                print("\n\nGibbsSubController on iteration {} of {}".format(i, iterations))
+                print("there are {} samplers".format(self.samplers))
+            for sampler in self.samplers:
+                if self.debug:
+                    print("on sampler", sampler)
+                sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0)
+                if self.debug:
+                    print("lnprob0 is", lnprob0)
+        return (None, lnprob0, None)
+
+    @property
+    def acceptance_fraction(self):
+        return [sampler.acceptance_fraction for sampler in self.samplers]
+
+    @property
+    def acor(self):
+        return [sampler.acor for sampler in self.samplers]
+
+    @property
+    def flatchain(self):
+        '''
+        Stack all of the separate subsamples into the standard emcee format. Assumes that each subsampler
+        has been run for the same amount of iterations.
+        '''
+        #check to make sure each sampler has been run for the same amount of iterations
+        assert np.all([sampler.iterations == self.samplers[0].iterations for sampler in self.samplers])
+        #concatenate samples into standard emcee format
+        return np.hstack([sampler.flatchain for sampler in self.samplers])
 
 class GibbsController:
     '''
-    One Sampler to rule them all. Rotates among all of the subsamplers.
+    One Sampler to rule them all. Rotates among all of the GibbsSamplers and GibbsSubControllers indiscriminately.
 
-    :param samplers: a list of the various GibbsSampler objects to iterate amongst
+    :param samplers: a list of the various GibbsSampler or GibbsSubController objects to iterate amongst
     '''
 
-    def __init__(self, samplers, debug=False):
+    def __init__(self, samplers, **kwargs):
         self.samplers = samplers
         self.nsamplers = len(self.samplers)
-        self.debug = debug
+        self.debug = kwargs.get("debug", False)
 
     def reset(self):
         for sampler in self.samplers:
@@ -196,19 +247,20 @@ class GibbsController:
         for i in range(iterations):
             if self.debug:
                 print("\n\nGibbsController on iteration {} of {}".format(i, iterations))
-            for j in range(self.nsamplers):
-                sampler = self.samplers[j]
-                
+            for sampler in self.samplers:
                 sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0)
                 if self.debug:
                     print("lnprob0 is", lnprob0)
 
+    @property
     def acceptance_fraction(self):
         return [sampler.acceptance_fraction for sampler in self.samplers]
 
+    @property
     def acor(self):
         return [sampler.acor for sampler in self.samplers]
 
+    @property
     def flatchain(self):
         '''
         Stack all of the separate subsamples into the standard emcee format. Assumes that each subsampler
