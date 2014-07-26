@@ -128,6 +128,9 @@ class GibbsSampler(Sampler):
 
             newlnprob = self.get_lnprob(q)
             diff = newlnprob - lnprob0
+            if self.debug:
+                print("old lnprob: {}".format(lnprob0))
+                print("proposed lnprob: {}".format(newlnprob))
 
             # M-H acceptance ratio
             if diff < 0:
