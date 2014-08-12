@@ -14,6 +14,7 @@ import numpy as np
 
 from . import autocorr
 from .sampler import Sampler
+import logging
 
 
 # === MHSampler ===
@@ -47,14 +48,16 @@ class GibbsSampler(Sampler):
 
     """
     def __init__(self, cov, p0, revertfn, *args, **kwargs):
-        try:
-            self.debug = kwargs["debug"]
-        except KeyError:
-            self.debug = False
         super(GibbsSampler, self).__init__(*args, **kwargs)
         self.cov = cov
         self.p0 = p0
         self.revertfn = revertfn
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.debug = kwargs.get("debug", False)
+        if self.debug:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
 
     def reset(self):
         super(GibbsSampler, self).reset()
@@ -62,7 +65,7 @@ class GibbsSampler(Sampler):
         self._lnprob = np.empty(0)
 
     def sample(self, p0, lnprob0=None, randomstate=None, thin=1,
-               storechain=True, iterations=1):
+               storechain=True, iterations=1, **kwargs):
         """
         Advances the chain ``iterations`` steps as an iterator
 
@@ -128,23 +131,20 @@ class GibbsSampler(Sampler):
 
             newlnprob = self.get_lnprob(q)
             diff = newlnprob - lnprob0
-            if self.debug:
-                print("old lnprob: {}".format(lnprob0))
-                print("proposed lnprob: {}".format(newlnprob))
+            self.logger.debug("old lnprob: {}".format(lnprob0))
+            self.logger.debug("proposed lnprob: {}".format(newlnprob))
 
             # M-H acceptance ratio
             if diff < 0:
                 diff = np.exp(diff) - self._random.rand()
                 if diff < 0:
                     #Reject the proposal and revert the state of the model
-                    if self.debug:
-                        print("Proposal rejected")
+                    self.logger.debug("Proposal rejected")
                     self.revertfn()
 
             if diff > 0:
                 #Accept the new proposal
-                if self.debug:
-                    print("Proposal accepted")
+                self.logger.debug("Proposal accepted")
                 p = q
                 lnprob0 = newlnprob
                 self.naccepted += 1
@@ -189,25 +189,27 @@ class GibbsSubController:
     def __init__(self, samplers, **kwargs):
         self.samplers = samplers
         self.nsamplers = len(self.samplers)
-        self.debug = kwargs.get("debug", False)
         self.p0 = None
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.debug = kwargs.get("debug", False)
+        if self.debug:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
 
     def reset(self):
         for sampler in self.samplers:
             sampler.reset()
 
-    def run_mcmc(self, p0, iterations, lnprob0):
+    def run_mcmc(self, p0, iterations, lnprob0, **kwargs):
         #p0 is taken as a parameter to act like a GibbsSampler for compatibility with GibbsController but is discarded
         for i in range(iterations):
-            if self.debug:
-                print("\n\nGibbsSubController on iteration {} of {}".format(i, iterations))
-                print("there are {} samplers".format(self.samplers))
+            self.logger.debug("On iteration {} of {}".format(i, iterations))
+            self.logger.debug("there are {} samplers".format(self.samplers))
             for sampler in self.samplers:
-                if self.debug:
-                    print("on sampler", sampler)
-                sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0)
-                if self.debug:
-                    print("lnprob0 is", lnprob0)
+                self.logger.debug("on sampler {}".format(sampler))
+                sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0, **kwargs)
+                self.logger.debug("lnprob0 is {}".format(lnprob0))
         return (None, lnprob0, None)
 
     @property
@@ -239,21 +241,29 @@ class GibbsController:
     def __init__(self, samplers, **kwargs):
         self.samplers = samplers
         self.nsamplers = len(self.samplers)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.debug = kwargs.get("debug", False)
+        if self.debug:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
 
     def reset(self):
         for sampler in self.samplers:
             sampler.reset()
 
-    def run(self, iterations):
+    def run(self, iterations, **kwargs):
+        #Ability to ignore a sampler
+        ignore = kwargs.get("ignore", (None,)) #tuple that states which class of sampler to ignore
         lnprob0 = -np.inf
         for i in range(iterations):
-            if self.debug:
-                print("\n\nGibbsController on iteration {} of {}".format(i, iterations))
+            self.logger.info("Iteration {} of {}".format(i, iterations))
             for sampler in self.samplers:
-                sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0)
-                if self.debug:
-                    print("lnprob0 is", lnprob0)
+                if type(sampler) not in ignore:
+                    sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0, **kwargs)
+                    self.logger.debug("lnprob0 is {}".format(lnprob0))
+                else:
+                    self.logger.debug("ignoring {} sampler".format(type(sampler)))
 
     @property
     def acceptance_fraction(self):
