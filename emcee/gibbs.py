@@ -257,7 +257,7 @@ class GibbsController:
         ignore = kwargs.get("ignore", (None,)) #tuple that states which class of sampler to ignore
         lnprob0 = -np.inf
         for i in range(iterations):
-            self.logger.info("Iteration {} of {}".format(i, iterations))
+            self.logger.debug("Iteration {} of {}".format(i, iterations))
             for sampler in self.samplers:
                 if type(sampler) not in ignore:
                     sampler.p0, lnprob0, state = sampler.run_mcmc(sampler.p0, 1, lnprob0=lnprob0, **kwargs)
