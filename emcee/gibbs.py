@@ -38,6 +38,10 @@ class GibbsSampler(Sampler):
         A function which reverts the model to the previous parameter values, in the
         case that the proposal parameters are rejected.
 
+    :param resample:
+        Redraw the previous lnprob at these parameters? Designed to work with the fact that an
+        Emulator is non-deterministic and prevent it from getting caught at a maximum.
+
     :param args: (optional)
         A list of extra positional arguments for ``lnpostfn``. ``lnpostfn``
         will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
@@ -54,6 +58,7 @@ class GibbsSampler(Sampler):
         self.revertfn = revertfn
         self.logger = logging.getLogger(self.__class__.__name__)
         self.debug = kwargs.get("debug", False)
+        self.resample = kwargs.get("resample", False) #
         if self.debug:
             self.logger.setLevel(logging.DEBUG)
         else:
@@ -122,6 +127,10 @@ class GibbsSampler(Sampler):
         # Use range instead of xrange for python 3 compatability
         for i in range(int(iterations)):
             self.iterations += 1
+
+            if self.resample:
+                #Recalculate the lnprob at the "old" parameters.
+                lnprob0 = self.get_lnprob(p)
 
             # Calculate the proposal distribution.
             if self.dim == 1:
