@@ -8,7 +8,7 @@ A Gibbs sampler for a state-ful model, using the MH code.
 from __future__ import (division, print_function, absolute_import,
                         unicode_literals)
 
-__all__ = ["GibbsSampler", "GibbsSubController", "GibbsController"]
+__all__ = ["GibbsSampler", "GibbsSubController", "GibbsController", "ParallelSampler"]
 
 import numpy as np
 
@@ -16,6 +16,189 @@ from . import autocorr
 from .sampler import Sampler
 import logging
 
+class ParallelSampler(Sampler):
+    """
+    The most basic possible Metropolis-Hastings style MCMC sampler, designed to be
+    encapsulated as part of a state-ful Gibbs sampler using multiple processes.
+
+    :param cov:
+        The covariance matrix to use for the proposal distribution.
+
+    :param dim:
+        Number of dimensions in the parameter space.
+
+    :param lnpostfn:
+        A function that takes a vector in the parameter space as input and
+        returns the natural logarithm of the posterior probability for that
+        position.
+
+    :param revertfn:
+        A function which reverts the model to the previous parameter values, in the
+        case that the proposal parameters are rejected.
+
+    :param acceptfn:
+        A function to be executed if the proposal is accepted.
+
+    :param resample:
+        Redraw the previous lnprob at these parameters? Designed to work with the fact that an
+        Emulator is non-deterministic and prevent it from getting caught at a maximum.
+
+    :param args: (optional)
+        A list of extra positional arguments for ``lnpostfn``. ``lnpostfn``
+        will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
+
+    :param kwargs: (optional)
+        A list of extra keyword arguments for ``lnpostfn``. ``lnpostfn``
+        will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
+
+    """
+    def __init__(self, cov, p0, *args, **kwargs):
+        super(ParallelSampler, self).__init__(*args, **kwargs)
+        self.prior = 0.0
+        self.cov = cov
+        self.p0 = p0
+        self.pconns = kwargs.get("pconns")
+        self.nprocs = len(self.pconns)
+        self.revertfn = kwargs.get("revertfn", None)
+        self.acceptfn = kwargs.get("acceptfn", None)
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.debug = kwargs.get("debug", False)
+        if self.debug:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
+
+    def reset(self):
+        super(ParallelSampler, self).reset()
+        self._chain = np.empty((0, self.dim))
+        self._lnprob = np.empty(0)
+
+    def sample(self, p0, lnprob0=None, randomstate=None, thin=1,
+               storechain=True, iterations=1, **kwargs):
+        """
+        Advances the chain ``iterations`` steps as an iterator
+
+        :param p0:
+            The initial position vector.
+
+        :param lnprob0: (optional)
+            The log posterior probability at position ``p0``. If ``lnprob``
+            is not provided, the initial value is calculated.
+
+        :param rstate0: (optional)
+            The state of the random number generator. See the
+            :func:`random_state` property for details.
+
+        :param iterations: (optional)
+            The number of steps to run.
+
+        :param thin: (optional)
+            If you only want to store and yield every ``thin`` samples in the
+            chain, set thin to an integer greater than 1.
+
+        :param storechain: (optional)
+            By default, the sampler stores (in memory) the positions and
+            log-probabilities of the samples in the chain. If you are
+            using another method to store the samples to a file or if you
+            don't need to analyse the samples after the fact (for burn-in
+            for example) set ``storechain`` to ``False``.
+
+        At each iteration, this generator yields:
+
+        * ``pos`` - The current positions of the chain in the parameter
+          space.
+
+        * ``lnprob`` - The value of the log posterior at ``pos`` .
+
+        * ``rstate`` - The current state of the random number generator.
+
+        """
+
+        self.random_state = randomstate
+
+        p = np.array(p0)
+        if lnprob0 is None:
+            lnprob0 = self.get_lnprob(p)
+
+        # Resize the chain in advance.
+        if storechain:
+            N = int(iterations / thin)
+            self._chain = np.concatenate((self._chain,
+                                          np.zeros((N, self.dim))), axis=0)
+            self._lnprob = np.append(self._lnprob, np.zeros(N))
+
+        i0 = self.iterations
+
+        # Use range instead of xrange for python 3 compatability
+        for i in range(int(iterations)):
+            self.iterations += 1
+
+            # Since the independent nuisance sampling may have changed parameters,
+            # query each process for the current lnprob
+            for pconn in self.pconns.values():
+                pconn.send(("GET_LNPROB", None))
+            #Collect the answer from each process
+            lnps = np.array([pconn.recv() for pconn in self.pconns.values()])
+            lnprob0 = np.sum(lnps) + self.prior
+            self.logger.debug("Collected lnprob from children after nuisance sampling : {}".format(lnprob0))
+
+            # Calculate the proposal distribution.
+            if self.dim == 1:
+                q = self._random.normal(loc=p[0], scale=self.cov[0], size=(1,))
+            else:
+                q = self._random.multivariate_normal(p, self.cov)
+
+            newlnprob = self.get_lnprob(q)
+            diff = newlnprob - lnprob0
+            self.logger.debug("old lnprob: {}".format(lnprob0))
+            self.logger.debug("proposed lnprob: {}".format(newlnprob))
+
+            # M-H acceptance ratio
+            if diff < 0:
+                diff = np.exp(diff) - self._random.rand()
+                if diff < 0:
+                    #Reject the proposal and revert the state of the model
+                    self.logger.debug("Proposal rejected")
+                    if self.revertfn is not None:
+                        self.revertfn()
+
+            if diff > 0:
+                #Accept the new proposal
+                self.logger.debug("Proposal accepted")
+                p = q
+                lnprob0 = newlnprob
+                self.naccepted += 1
+                if self.acceptfn is not None:
+                    self.acceptfn()
+
+            if storechain and i % thin == 0:
+                ind = i0 + int(i / thin)
+                self._chain[ind, :] = p
+                self._lnprob[ind] = lnprob0
+
+            # Heavy duty iterator action going on right here...
+            yield p, lnprob0, self.random_state
+
+    @property
+    def acor(self):
+        """
+        An estimate of the autocorrelation time for each parameter (length:
+        ``dim``).
+
+        """
+        return self.get_autocorr_time()
+
+    def get_autocorr_time(self, window=50):
+        """
+        Compute an estimate of the autocorrelation time for each parameter
+        (length: ``dim``).
+
+        :param window: (optional)
+            The size of the windowing function. This is equivalent to the
+            maximum number of lags to use. (default: 50)
+
+        """
+        return autocorr.integrated_time(self.chain, axis=0, window=window)
 
 # === MHSampler ===
 class GibbsSampler(Sampler):
@@ -38,6 +221,9 @@ class GibbsSampler(Sampler):
         A function which reverts the model to the previous parameter values, in the
         case that the proposal parameters are rejected.
 
+    :param acceptfn:
+        A function to be executed if the proposal is accepted.
+
     :param resample:
         Redraw the previous lnprob at these parameters? Designed to work with the fact that an
         Emulator is non-deterministic and prevent it from getting caught at a maximum.
@@ -51,14 +237,14 @@ class GibbsSampler(Sampler):
         will be called with the sequence ``lnpostfn(p, *args, **kwargs)``.
 
     """
-    def __init__(self, cov, p0, revertfn, *args, **kwargs):
+    def __init__(self, cov, p0, *args, **kwargs):
         super(GibbsSampler, self).__init__(*args, **kwargs)
         self.cov = cov
         self.p0 = p0
-        self.revertfn = revertfn
+        self.revertfn = kwargs.get("revertfn", None)
+        self.acceptfn = kwargs.get("acceptfn", None)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.debug = kwargs.get("debug", False)
-        self.resample = kwargs.get("resample", False) #
         if self.debug:
             self.logger.setLevel(logging.DEBUG)
         else:
@@ -128,10 +314,6 @@ class GibbsSampler(Sampler):
         for i in range(int(iterations)):
             self.iterations += 1
 
-            if self.resample:
-                #Recalculate the lnprob at the "old" parameters.
-                lnprob0 = self.get_lnprob(p)
-
             # Calculate the proposal distribution.
             if self.dim == 1:
                 q = self._random.normal(loc=p[0], scale=self.cov[0], size=(1,))
@@ -149,7 +331,8 @@ class GibbsSampler(Sampler):
                 if diff < 0:
                     #Reject the proposal and revert the state of the model
                     self.logger.debug("Proposal rejected")
-                    self.revertfn()
+                    if self.revertfn is not None:
+                        self.revertfn()
 
             if diff > 0:
                 #Accept the new proposal
@@ -157,6 +340,8 @@ class GibbsSampler(Sampler):
                 p = q
                 lnprob0 = newlnprob
                 self.naccepted += 1
+                if self.acceptfn is not None:
+                    self.acceptfn()
 
             if storechain and i % thin == 0:
                 ind = i0 + int(i / thin)
